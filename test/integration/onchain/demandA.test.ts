@@ -155,5 +155,85 @@ describe('on-chain', function () {
         state: 'created',
       })
     })
+    it('comment on many demandAs on chain in parallel', async function () {
+      const numberDemands = 500
+
+      const demandIds = await Promise.all(
+        Array(numberDemands)
+          .fill(null)
+          .map(async () => {
+            const {
+              status,
+              body: { id: demandAId },
+            } = await post(context.app, '/v1/demandA', { parametersAttachmentId })
+            expect(status).to.equal(201)
+            return demandAId as string
+          })
+      )
+
+      const transactionIds = await Promise.all(
+        demandIds.map(async (demandAId) => {
+          const response = await post(context.app, `/v1/demandA/${demandAId}/creation`, {})
+          expect(response.status).to.equal(201)
+
+          const { id: transactionId, state } = response.body
+          expect(transactionId).to.match(
+            /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89ABab][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/
+          )
+          expect(state).to.equal('submitted')
+
+          return transactionId as string
+        })
+      )
+
+      await node.sealBlock()
+
+      await Promise.all(
+        transactionIds.map(async (tx) => {
+          await pollTransactionState(db, tx, 'finalised')
+        })
+      )
+
+      await Promise.all(
+        demandIds.map(async (demand) => {
+          await pollDemandState(db, demand, 'created', 500, 100)
+
+          const [demandA] = await db.getDemand(demand)
+          expect(demandA).to.contain({
+            id: demand,
+            state: 'created',
+            subtype: 'demand_a',
+            parametersAttachmentId,
+          })
+        })
+      )
+      const commentResponses = await Promise.all(
+        demandIds.map(async (demandAId) => {
+          const commentResponse = await post(context.app, `/v1/demandA/${demandAId}/comment`, {
+            attachmentId: parametersAttachmentId,
+          })
+          expect(commentResponse.status).to.equal(201)
+          return commentResponse.body.id as string
+        })
+      )
+      await node.sealBlock()
+
+      await Promise.all(
+        commentResponses.map(async (commentResponseId) => {
+          await pollTransactionState(db, commentResponseId, 'finalised')
+          await pollDemandCommentState(db, commentResponseId, 'created')
+          const [maybeComment] = await db.getDemandCommentForTransaction(commentResponseId)
+          if (!maybeComment) {
+            expect.fail('Expected comment to be in db')
+          }
+          const { id, createdAt, ...comment } = maybeComment
+          expect(comment).to.deep.equal({
+            owner: selfAddress,
+            attachmentId: parametersAttachmentId,
+            state: 'created',
+          })
+        })
+      )
+    })
   })
 })
